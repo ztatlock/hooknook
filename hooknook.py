@@ -234,7 +234,7 @@ def app_setup():
 
         app.github_networks = [netaddr.IPNetwork(cidr) for cidr in cidrs]
         app.logger.info(
-            'Loaded GitHub networks: %s',
+            'Loaded GitHub/GitLab networks: %s',
             [str(n) for n in app.github_networks]
         )
 
@@ -252,14 +252,23 @@ def hook():
             break
     else:
         app.logger.info('Hook request from disallowed host %s', addr)
-        return flask.jsonify(status='you != GitHub'), 403
+        return flask.jsonify(status='you != GitHub/GitLab'), 403
 
-    # Dispatch based on event type.
+    # Dispatch GitHub event.
     event_type = request.headers.get('X-GitHub-Event')
-    if not event_type:
-        app.logger.info('Received a non-hook request')
-        return flask.jsonify(status='not a hook'), 403
-    elif event_type == 'ping':
+    if event_type:
+        return handle_github_hook(event_type, request)
+
+    # Dispatch GitLab event.
+    event_type = request.headers.get('X-GitLab-Event')
+    if event_type:
+        return handle_gitlab_hook(event_type, request)
+
+    app.logger.info('Received a non-hook request')
+    return flask.jsonify(status='not a hook'), 403
+
+def handle_github_hook(event_type, request):
+    if event_type == 'ping':
         return flask.jsonify(status='pong')
     elif event_type == 'push':
         payload = request.get_json()
@@ -282,8 +291,32 @@ def hook():
         )
         return flask.jsonify(status='handled'), 202
     else:
-        return flask.jsonify(status='unhandled event', event=event_type), 501
+        return flask.jsonify(status='unhandled GitHub event', event=event_type), 501
 
+def handle_gitlab_hook(event_type, request):
+    if event_type == 'Push Hook':
+        payload = request.get_json()
+        proj = payload['project']
+
+        # If a user whitelist is specified, validate the owner.
+        owner = proj['name']
+        allowed_users = app.config['USERS']
+        if allowed_users and owner not in allowed_users:
+            return flask.jsonify(status='user not allowed', user=owner), 403
+
+        repo = payload['repository']
+        name = repo['name']
+        if repo['visibility_level'] == 0:
+            url = repo['git_ssh_url']
+        else:
+            url = repo['git_http_url']
+        app.worker.send(
+            FILENAME_FORMAT.format(user=owner, repo=name),
+            url
+        )
+        return flask.jsonify(status='handled'), 202
+    else:
+        return flask.jsonify(status='unhandled GitLab event', event=event_type), 501
 
 @app.route('/login')
 def login():
